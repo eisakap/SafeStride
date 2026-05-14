@@ -1,19 +1,3 @@
-/**
- * SafeStride — ESP32-CAM mobility aid firmware
- *
- * - Camera capture + optional TensorFlow Lite Micro inference (person / obstacle).
- * - VL53L0X time-of-flight via I2C (non-I2C pins routed away from CAM bus).
- * - Haptic: LEDC PWM duty + frequency tiers scale with proximity (no delay()).
- *
- * Wiring (AI Thinker ESP32-CAM — adjust to your board):
- *   VL53L0X VIN -> 3V3, GND -> GND
- *   VL53L0X SDA -> GPIO13, SCL -> GPIO14 (change kI2cSdaPin / kI2cSclPin if needed)
- *   Vibration motor (+ driver) PWM -> GPIO16 (kHapticPin)
- *
- * Default GitHub build uses SAFE_STRIDE_SIMULATED_ML (see platformio.ini): fake “person” score.
- * For real TFLite: set -DSAFE_STRIDE_SIMULATED_ML=0 and install real weights in person_detect_model_data.cpp.
- */
-
 #include <Arduino.h>
 #include <math.h>
 #include <Wire.h>
@@ -28,32 +12,23 @@
 #include "tensorflow/lite/micro/system_setup.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
-// ---------------------------------------------------------------------------
-// Hardware tuning (ESP32-CAM AI Thinker defaults; change for your prototype)
-// ---------------------------------------------------------------------------
 static constexpr int kI2cSdaPin = 13;
 static constexpr int kI2cSclPin = 14;
 static constexpr int kHapticPin = 16;
 static constexpr ledc_channel_t kHapticLedcChannel = LEDC_CHANNEL_1;
 
-// ML input size (match your model — person_detect reference uses 96×96)
 static constexpr int kModelW = 96;
 static constexpr int kModelH = 96;
 
-// Behaviour thresholds
-static constexpr uint16_t kTofCriticalMm = 1000;  // fusion trip distance
-static constexpr uint16_t kTofValidMaxMm = 8190;  // VL53L0X timeout / no-return sentinel
-static constexpr float kMlConfidenceTrip = 0.60f;  // Espressif demo uses ~60% person score
-static constexpr uint32_t kFramePeriodMs = 160;    // ML path — lower = more responsive, hotter CPU
+static constexpr uint16_t kTofCriticalMm = 1000;
+static constexpr uint16_t kTofValidMaxMm = 8190;
+static constexpr float kMlConfidenceTrip = 0.60f;
+static constexpr uint32_t kFramePeriodMs = 160;
 static constexpr uint32_t kTofPeriodMs = 45;
 static constexpr uint32_t kHapticRefreshMs = 12;
 
-// Tensor arena (person_detect graph fits in ~100 KB; extra headroom for alignment / growth)
 static constexpr size_t kTensorArenaBytes = 150 * 1024;
 
-// ---------------------------------------------------------------------------
-// Camera pins — AI Thinker ESP32-CAM
-// ---------------------------------------------------------------------------
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM (-1)
 #define XCLK_GPIO_NUM 0
@@ -71,15 +46,12 @@ static constexpr size_t kTensorArenaBytes = 150 * 1024;
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// ---------------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------------
 static VL53L0X g_tof;
 static bool g_cam_ok = false;
 static bool g_tof_ok = false;
 static bool g_ml_ok = false;
-/** GitHub/portfolio mode: no TFLite interpreter; score is synthesized. */
 static bool g_ml_simulated = false;
+static tflite::MicroErrorReporter g_error_reporter;
 static const tflite::Model* g_model = nullptr;
 static tflite::AllOpsResolver g_resolver;
 static tflite::MicroInterpreter* g_interpreter = nullptr;
@@ -96,11 +68,9 @@ static uint32_t g_next_frame_ms = 0;
 static uint32_t g_next_tof_ms = 0;
 static uint32_t g_next_haptic_ms = 0;
 
-// Debug counters
 static uint32_t g_cam_fail = 0;
 static uint32_t g_ml_invoke_fail = 0;
 
-// Forward declarations
 static bool initCamera();
 static bool initTof();
 static bool initMl();
@@ -117,7 +87,7 @@ static void applyHapticFromDistance(uint16_t distance_mm, bool alert_active) {
     return;
   }
 
-  const uint16_t near_clip = 150;  // clamp “too close” motor behaviour
+  const uint16_t near_clip = 150;
   uint16_t d = distance_mm;
   if (d < near_clip) {
     d = near_clip;
@@ -126,7 +96,6 @@ static void applyHapticFromDistance(uint16_t distance_mm, bool alert_active) {
     d = kTofCriticalMm;
   }
 
-  // Invert proximity → stronger pulse as distance shrinks (TOF-driven intensity).
   const float span = static_cast<float>(kTofCriticalMm - near_clip);
   float closeness = 1.0f - (static_cast<float>(d - near_clip) / span);
   if (closeness < 0.0f) {
@@ -136,7 +105,6 @@ static void applyHapticFromDistance(uint16_t distance_mm, bool alert_active) {
     closeness = 1.0f;
   }
 
-  // Frequency tiers (Hz): closer → higher tick rate; duty follows closeness.
   uint32_t freq_hz = 90;
   if (closeness > 0.85f) {
     freq_hz = 340;
@@ -152,7 +120,7 @@ static void applyHapticFromDistance(uint16_t distance_mm, bool alert_active) {
   const uint32_t duty_max = (1u << 10) - 1u;
   uint32_t duty = static_cast<uint32_t>(duty_max * closeness);
   if (duty < 48 && alert_active) {
-    duty = 48;  // ensure perceptible minimum when alert is active
+    duty = 48;
   }
   ledcWrite(kHapticLedcChannel, duty);
 }
@@ -223,7 +191,6 @@ static void fillInputTensor(const uint8_t* gray96) {
       break;
     }
     case kTfLiteInt8: {
-      // Same unsigned→signed mapping as Espressif person_detection image_provider.cc (grayscale path).
       for (int i = 0; i < n; ++i) {
         g_input->data.int8[i] =
             static_cast<int8_t>(static_cast<uint8_t>(gray96[i]) ^ 0x80u);
@@ -270,7 +237,6 @@ static float interpretPersonObstacleScore() {
     return 0.0f;
   }
 
-  // person_detection model: index 0 = not_person, 1 = person (model_settings.h in upstream example)
   constexpr int kPersonClassIndex = 1;
   float p = (flat >= 2) ? dequantizeOutputScalar(g_output, kPersonClassIndex)
                         : dequantizeOutputScalar(g_output, 0);
@@ -316,7 +282,7 @@ static bool initCamera() {
 #endif
 
   auto try_init = [&](camera_config_t& c) -> esp_err_t {
-    esp_camera_deinit();  // ensure clean state between attempts
+    esp_camera_deinit();
     return esp_camera_init(&c);
   };
 
@@ -363,7 +329,6 @@ static bool initTof() {
   }
   g_tof.setSignalRateLimit(0.25f);
   g_tof.setMeasurementTimingBudget(22000);
-  // Continuous mode keeps range read latency predictable without long singles.
   g_tof.startContinuous(33);
   return true;
 }
@@ -451,7 +416,6 @@ void setup() {
   Serial.begin(115200);
   const uint32_t boot_t = nowMs();
   while (!Serial && (nowMs() - boot_t) < 1500) {
-    // brief wait for USB serial; still non-blocking overall loop timing later
   }
 
   logLine(F("\n=== SafeStride boot ==="));
@@ -485,7 +449,6 @@ void setup() {
 void loop() {
   const uint32_t t = nowMs();
 
-  // TOF sampling
   if (g_tof_ok && t >= g_next_tof_ms) {
     g_next_tof_ms = t + kTofPeriodMs;
     const uint16_t mm = g_tof.readRangeContinuousMillimeters();
@@ -494,7 +457,6 @@ void loop() {
     }
   }
 
-  // Camera + real or simulated “ML”
   if (g_ml_ok && t >= g_next_frame_ms) {
     g_next_frame_ms = t + kFramePeriodMs;
 
@@ -553,7 +515,6 @@ void loop() {
     g_next_haptic_ms = t + kHapticRefreshMs;
     uint16_t haptic_distance = g_last_tof_mm;
     if (!g_tof_ok || g_last_tof_mm >= kTofValidMaxMm) {
-      // No valid TOF — use critical distance mapping so ML-only alerts still buzz
       haptic_distance = kTofCriticalMm;
     }
     applyHapticFromDistance(haptic_distance, alert);
@@ -569,6 +530,5 @@ void loop() {
   }
 #endif
 
-  // Yield minimal idle time to WiFi/BT stacks without using delay()
   yield();
 }
